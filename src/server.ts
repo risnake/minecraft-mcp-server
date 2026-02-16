@@ -23,8 +23,10 @@ import {
   CraftItemSchema,
   EquipItemSchema,
 } from "./schemas.js";
-import { goals } from "mineflayer-pathfinder";
+import pathfinderModule from "mineflayer-pathfinder";
 import minecraftData from "minecraft-data";
+
+const { goals } = pathfinderModule as typeof import("mineflayer-pathfinder");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -66,11 +68,13 @@ function ok(text: string) {
 function commandText(result: CommandResult): string {
   switch (result.category) {
     case "timeout":
-      return `Command executed but no matching feedback within timeout: ${result.command}`;
+      return `Command feedback timed out: ${result.command}`;
     case "permission_denied":
       return `Permission error while executing command: ${result.command}\nResponse: ${result.matchedResponse}`;
     case "unknown_command":
       return `Unknown/invalid command: ${result.command}\nResponse: ${result.matchedResponse}`;
+    case "failed":
+      return `Command failed: ${result.command}\nResponse: ${result.matchedResponse ?? "(no response)"}`;
     case "success":
     default:
       return `Command executed: ${result.command}\nResponse: ${result.matchedResponse ?? "(no response)"}`;
@@ -92,8 +96,9 @@ function commandResponse(
       matchedResponse: result.matchedResponse,
       timedOut: result.timedOut,
       category: result.category,
+      executed: result.executed,
     },
-    isError: result.category === "permission_denied" || result.category === "unknown_command",
+    isError: !result.executed,
   };
 }
 
@@ -260,19 +265,108 @@ function registerCreativeTools(server: McpServer, session: MinecraftSession): vo
         };
       }
 
+      const withTimeout = async <T>(promise: Promise<T>, timeoutMs: number): Promise<T> => {
+        return await new Promise<T>((resolve, reject) => {
+          const timer = setTimeout(() => {
+            reject(new Error(`Timed out after ${timeoutMs}ms`));
+          }, timeoutMs);
+          timer.unref();
+
+          promise.then(
+            (value) => {
+              clearTimeout(timer);
+              resolve(value);
+            },
+            (error: unknown) => {
+              clearTimeout(timer);
+              reject(error);
+            }
+          );
+        });
+      };
+
+      const DIRECT_FLY_TIMEOUT_MS = 8_000;
+      const ARC_STAGE_TIMEOUT_MS = 10_000;
       const destination = new Vec3(args.x, args.y, args.z);
-      await bot.creative.flyTo(destination);
-      const pos = session.getPosition();
+      const parameters = { x: args.x, y: args.y, z: args.z };
+      let directError: string | null = null;
+      let arcError: string | null = null;
+
+      try {
+        await withTimeout(bot.creative.flyTo(destination), DIRECT_FLY_TIMEOUT_MS);
+        const pos = session.getPosition();
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Flew to (${args.x}, ${args.y}, ${args.z}) with direct creative flight. Current position: (${pos.x}, ${pos.y}, ${pos.z}).`,
+          }],
+          structuredContent: {
+            tool: "fly_to",
+            parameters,
+            method: "direct_fly",
+            executionConfirmed: true,
+            arrivedAt: { x: pos.x, y: pos.y, z: pos.z },
+          },
+        };
+      } catch (err: unknown) {
+        directError = err instanceof Error ? err.message : String(err);
+      }
+
+      try {
+        const currentPos = bot.entity.position.clone();
+        const arcAltitude = Math.max(currentPos.y, args.y) + 16;
+        const risePoint = new Vec3(currentPos.x, arcAltitude, currentPos.z);
+        const travelPoint = new Vec3(args.x, arcAltitude, args.z);
+
+        await withTimeout(bot.creative.flyTo(risePoint), ARC_STAGE_TIMEOUT_MS);
+        await withTimeout(bot.creative.flyTo(travelPoint), ARC_STAGE_TIMEOUT_MS);
+        await withTimeout(bot.creative.flyTo(destination), ARC_STAGE_TIMEOUT_MS);
+
+        const pos = session.getPosition();
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Flew to (${args.x}, ${args.y}, ${args.z}) with multi-stage arc flight. Current position: (${pos.x}, ${pos.y}, ${pos.z}).`,
+          }],
+          structuredContent: {
+            tool: "fly_to",
+            parameters,
+            method: "arc_fly",
+            executionConfirmed: true,
+            arcAltitude,
+            arrivedAt: { x: pos.x, y: pos.y, z: pos.z },
+          },
+        };
+      } catch (err: unknown) {
+        arcError = err instanceof Error ? err.message : String(err);
+      }
+
+      const teleportResult = await session.executeCommand(`/tp @s ${args.x} ${args.y} ${args.z}`);
+      const teleportSucceeded = teleportResult.executed;
+      const pos = teleportSucceeded ? session.getPosition() : null;
+
       return {
         content: [{
           type: "text" as const,
-          text: `Flew to (${args.x}, ${args.y}, ${args.z}). Current position: (${pos.x}, ${pos.y}, ${pos.z}).`,
+          text: teleportSucceeded
+            ? `Creative flight failed; teleported to (${args.x}, ${args.y}, ${args.z}) via command fallback.`
+            : `Failed to reach (${args.x}, ${args.y}, ${args.z}) using direct fly, arc fly, and teleport fallback.`,
         }],
         structuredContent: {
           tool: "fly_to",
-          parameters: { x: args.x, y: args.y, z: args.z },
-          arrivedAt: { x: pos.x, y: pos.y, z: pos.z },
+          parameters,
+          method: "teleport_fallback",
+          executionConfirmed: teleportSucceeded,
+          arrivedAt: pos ? { x: pos.x, y: pos.y, z: pos.z } : null,
+          directFlyError: directError,
+          arcFlyError: arcError,
+          command: teleportResult.command,
+          matchedResponse: teleportResult.matchedResponse,
+          timedOut: teleportResult.timedOut,
+          category: teleportResult.category,
+          executed: teleportResult.executed,
         },
+        isError: !teleportSucceeded,
       };
     })
   );

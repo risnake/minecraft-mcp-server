@@ -130,7 +130,7 @@ Available when `MC_MODE=creative`. These use server commands and require **opera
 | `set_weather` | Set weather (clear, rain, thunder) with optional duration |
 | `set_gamerule` | Set a game rule |
 | `summon_entity` | Summon an entity with optional NBT data |
-| `fly_to` | Fly the bot to coordinates using creative flight |
+| `fly_to` | Fly the bot to coordinates using creative flight (fallback chain: direct → arc → teleport) |
 
 ### Survival-Only Tools
 
@@ -146,6 +146,26 @@ Available when `MC_MODE=survival`. These use Mineflayer plugins ([pathfinder](ht
 | `equip_item` | Equip an item to a slot (hand, head, torso, legs, feet, off-hand) |
 
 > **Why no `execute_command`?** We intentionally expose explicit, typed tools instead of a raw command passthrough. Each tool validates its inputs and returns structured results, giving the agent better feedback and preventing command-injection mistakes.
+
+### Structured Tool Output
+
+All creative command tools (`setblock`, `fill`, `clone_area`, `give_item`, `teleport_to`, `set_time`, `set_weather`, `set_gamerule`, `summon_entity`) return structured metadata alongside the human-readable text:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `executed` | `boolean` | Whether the command was confirmed as successfully executed |
+| `category` | `string` | Outcome category: `success`, `permission_denied`, `unknown_command`, `failed`, or `timeout` |
+| `timedOut` | `boolean` | Whether the server feedback window expired before a response was received |
+
+Unconfirmed, timed-out, and failed outcomes are reported as errors (`isError: true`) so the agent can detect and recover from issues automatically.
+
+`fly_to` uses a three-stage fallback chain and returns additional fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `method` | `string` | Which strategy succeeded: `direct_fly`, `arc_fly`, or `teleport_fallback` |
+| `executionConfirmed` | `boolean` | Whether the bot arrived at the target coordinates |
+| `arrivedAt` | `object \| null` | Final `{x, y, z}` position after the attempt |
 
 ## Examples
 
@@ -215,7 +235,16 @@ Creative command tools wait **5 seconds** for server feedback. A timeout means:
 - The command may have executed but produced no recognizable response
 - The server may be lagging
 
-The tool returns category `"timeout"` — this is **not necessarily an error**; some commands succeed silently.
+The tool returns `category: "timeout"` and `timedOut: true`, and is treated as an error (`isError: true`) so the agent can decide how to proceed.
+
+### `fly_to` failures
+
+`fly_to` automatically tries three strategies in order:
+1. **Direct flight** — `bot.creative.flyTo()` to the target
+2. **Arc flight** — rises to a dynamic altitude above current/target Y, flies horizontally, then descends (avoids obstacles)
+3. **Teleport fallback** — `/tp` command if both flight methods fail
+
+Check `method` in the response to see which strategy was used. If all three fail, `executionConfirmed` is `false` and `isError` is `true`.
 
 ### Connection issues
 

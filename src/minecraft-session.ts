@@ -1,10 +1,12 @@
 import mineflayer, { type Bot } from "mineflayer";
 import { Vec3 } from "vec3";
 import type { McMode, MinecraftConnectionConfig } from "./config.js";
-import { pathfinder, Movements } from "mineflayer-pathfinder";
+import pathfinderModule from "mineflayer-pathfinder";
 import collectblock from "mineflayer-collectblock";
 import toolPlugin from "mineflayer-tool";
 import minecraftData from "minecraft-data";
+
+const { pathfinder, Movements } = pathfinderModule as typeof import("mineflayer-pathfinder");
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -32,7 +34,8 @@ export interface CommandResult {
   command: string;
   matchedResponse: string | null;
   timedOut: boolean;
-  category: "success" | "permission_denied" | "unknown_command" | "timeout";
+  category: "success" | "permission_denied" | "unknown_command" | "failed" | "timeout";
+  executed: boolean;
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -42,18 +45,29 @@ const SPAWN_TIMEOUT_MS = 30_000;
 const COMMAND_TIMEOUT_MS = 5_000;
 const COMMAND_SUCCESS_PATTERNS = [
   /set the block/i,
+  /changed the block at/i,
   /filled \d+ blocks?/i,
+  /successfully filled/i,
   /gave .* to /i,
+  /^gave /i,
   /teleported/i,
+  /^teleported /i,
   /summoned/i,
   /changed the time/i,
+  /set the time to/i,
   /changed the weather/i,
+  /set the weather to/i,
+  /changed the weather to/i,
   /game mode has been updated/i,
   /saved the game/i,
   /(\d+ )?entities? (?:have been |was )?killed/i,
   /\bok\b/i,
   /\d+ blocks? cloned/i,
+  /successfully cloned/i,
   /gamerule .* (?:set to|is )/i,
+  /game rule .* (?:set to|is )/i,
+  /gamerule .* (?:has been|was) updated/i,
+  /the value of gamerule .* is/i,
   /set the time to /i,
   /changing to /i,
 ];
@@ -66,6 +80,13 @@ const COMMAND_PERMISSION_PATTERNS = [
   /not permitted/i,
 ];
 const COMMAND_UNKNOWN_PATTERNS = [/unknown command/i, /unknown or incomplete command/i];
+const COMMAND_FAILED_PATTERNS = [
+  /failed/i,
+  /no blocks? (?:were )?(?:filled|changed|cloned)/i,
+  /cannot place blocks? outside of the world/i,
+  /that position is not loaded/i,
+  /could not/i,
+];
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -94,6 +115,7 @@ export class MinecraftSession {
   private controlTimers: Map<string, NodeJS.Timeout> = new Map();
   private messageWaiters: {
     patterns: RegExp[];
+    systemOnly: boolean;
     resolve: (value: ChatEntry | null) => void;
     timer: NodeJS.Timeout;
   }[] = [];
@@ -205,27 +227,30 @@ export class MinecraftSession {
     log(`Connected and spawned as ${bot.username}`);
 
     bot.on("chat", (sender: string, message: string) => {
-      this.pushChat(sender, message);
+      this.pushChat(sender, message, false);
     });
 
-    bot.on("message", (jsonMsg) => {
-      this.pushChat("", jsonMsg.toString());
+    bot.on("message", (jsonMsg: { toString: () => string }, position?: unknown, sender?: unknown) => {
+      const text = jsonMsg.toString();
+      const senderName = typeof sender === "string" ? sender : "";
+      const isSystemFeedback = this.isSystemFeedbackMessage(position, senderName, text);
+      this.pushChat(senderName, text, isSystemFeedback);
     });
 
     bot.on("kicked", (reason: string) => {
       log(`Kicked: ${reason}`);
-      this.pushChat("", `[Kicked] ${reason}`);
+      this.pushChat("", `[Kicked] ${reason}`, true);
       this.teardown();
     });
 
     bot.on("error", (err: Error) => {
       log(`Bot error: ${err.message}`);
-      this.pushChat("", `[Error] ${err.message}`);
+      this.pushChat("", `[Error] ${err.message}`, true);
     });
 
     bot.on("end", (reason: string) => {
       log(`Connection ended: ${reason}`);
-      this.pushChat("", `[Disconnected] ${reason}`);
+      this.pushChat("", `[Disconnected] ${reason}`, true);
       this.teardown();
     });
   }
@@ -284,10 +309,11 @@ export class MinecraftSession {
     const matchPatterns = [
       ...COMMAND_PERMISSION_PATTERNS,
       ...COMMAND_UNKNOWN_PATTERNS,
+      ...COMMAND_FAILED_PATTERNS,
       ...COMMAND_SUCCESS_PATTERNS,
     ];
 
-    const awaitFeedback = this.awaitMessage(matchPatterns, COMMAND_TIMEOUT_MS);
+    const awaitFeedback = this.awaitMessage(matchPatterns, COMMAND_TIMEOUT_MS, { systemOnly: true });
     bot.chat(normalizedCommand);
     const feedback = await awaitFeedback;
 
@@ -297,17 +323,20 @@ export class MinecraftSession {
         matchedResponse: null,
         timedOut: true,
         category: "timeout",
+        executed: false,
       };
     }
 
     const text = feedback.text;
-    const lower = text.toLowerCase();
-
-    let category: CommandResult["category"] = "success";
-    if (COMMAND_UNKNOWN_PATTERNS.some((pattern) => pattern.test(lower))) {
+    let category: CommandResult["category"];
+    if (COMMAND_UNKNOWN_PATTERNS.some((pattern) => pattern.test(text))) {
       category = "unknown_command";
-    } else if (COMMAND_PERMISSION_PATTERNS.some((pattern) => pattern.test(lower))) {
+    } else if (COMMAND_PERMISSION_PATTERNS.some((pattern) => pattern.test(text))) {
       category = "permission_denied";
+    } else if (COMMAND_SUCCESS_PATTERNS.some((pattern) => pattern.test(text))) {
+      category = "success";
+    } else {
+      category = "failed";
     }
 
     return {
@@ -315,6 +344,7 @@ export class MinecraftSession {
       matchedResponse: text,
       timedOut: false,
       category,
+      executed: category === "success",
     };
   }
 
@@ -412,7 +442,7 @@ export class MinecraftSession {
 
   // ── Internal helpers ─────────────────────────────────────────────────────
 
-  private pushChat(sender: string, text: string): void {
+  private pushChat(sender: string, text: string, isSystemMessage: boolean): void {
     const entry: ChatEntry = { timestamp: Date.now(), sender, text };
     this.chatBuffer.push(entry);
     if (this.chatBuffer.length > MAX_CHAT_BUFFER) {
@@ -421,6 +451,9 @@ export class MinecraftSession {
 
     for (let i = this.messageWaiters.length - 1; i >= 0; i--) {
       const waiter = this.messageWaiters[i];
+      if (waiter.systemOnly && !isSystemMessage) {
+        continue;
+      }
       if (waiter.patterns.some((pattern) => pattern.test(text))) {
         clearTimeout(waiter.timer);
         waiter.resolve(entry);
@@ -429,7 +462,12 @@ export class MinecraftSession {
     }
   }
 
-  private awaitMessage(patterns: RegExp[], timeoutMs: number): Promise<ChatEntry | null> {
+  private awaitMessage(
+    patterns: RegExp[],
+    timeoutMs: number,
+    options?: { systemOnly?: boolean }
+  ): Promise<ChatEntry | null> {
+    const systemOnly = options?.systemOnly ?? false;
     return new Promise<ChatEntry | null>((resolve) => {
       const timer = setTimeout(() => {
         const index = this.messageWaiters.findIndex((waiter) => waiter.resolve === resolve);
@@ -442,10 +480,40 @@ export class MinecraftSession {
 
       this.messageWaiters.push({
         patterns,
+        systemOnly,
         resolve,
         timer,
       });
     });
+  }
+
+  private isSystemFeedbackMessage(position: unknown, sender: string, text: string): boolean {
+    const normalizedSender = sender.trim().toLowerCase();
+    if (normalizedSender === "server") {
+      return true;
+    }
+
+    if (sender.trim().length > 0) {
+      return false;
+    }
+
+    if (typeof position === "string") {
+      if (position === "chat") return false;
+      if (position === "system" || position === "game_info") return true;
+    }
+
+    if (typeof position === "number") {
+      // Legacy MC protocol chat position: 0=chat, 1=system, 2=game_info
+      if (position === 0) return false;
+      if (position === 1 || position === 2) return true;
+    }
+
+    // Chat-style user messages are typically rendered as "<name> message".
+    if (/^<[^>]+>\s/.test(text)) {
+      return false;
+    }
+
+    return true;
   }
 
   private normalizeCommand(command: string): string {
